@@ -45,7 +45,7 @@ class PredictionNode(Node):
         self.declare_parameter('sequence_length', 30)
         self.declare_parameter('model_type', 'lstm')
         self.declare_parameter('model_checkpoint', '')
-        self.declare_parameter('device', 'cpu')
+        self.declare_parameter('device', 'cuda')
         self.declare_parameter('correction_topic', '/ap/state/correction')
 
         synced_topic = str(self.get_parameter('synced_topic').value)
@@ -166,6 +166,8 @@ class PredictionNode(Node):
             msg: Time-aligned nav + IMU message from interpolate node.
         """
         self.latest_synced = msg
+        # The feature buffer is a rolling window of the last N samples, where N is
+        # the sequence length, the dequeu automatically discards the oldest sample when a new one is added.
         self.feature_buffer.append(self._message_to_feature(msg))
 
         correction = self._run_inference()
