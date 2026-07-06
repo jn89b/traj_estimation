@@ -1,7 +1,7 @@
-from click import Tuple
+from typing import Tuple
 
 import numpy as np
-import casadi as ca
+# import casadi as ca
 import math
 
 def rot2d(psi):

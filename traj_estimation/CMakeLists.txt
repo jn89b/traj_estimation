@@ -19,12 +19,8 @@ find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
-
-rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/SyncedNavImu.msg"
-  DEPENDENCIES std_msgs sensor_msgs
-)
+find_package(geographic_msgs REQUIRED)
+find_package(traj_estimation_msgs REQUIRED)
 
 # Include Cpp "include" directory
 include_directories(include)
@@ -33,6 +29,7 @@ add_executable(main_pub src/main_pub.cpp src/minimal_publisher.cpp)
 ament_target_dependencies(main_pub
     rclcpp
     std_msgs
+    traj_estimation_msgs
 )
 # Install Cpp executables
 install(TARGETS

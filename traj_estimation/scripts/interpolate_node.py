@@ -27,7 +27,7 @@ from traj_estimation.rotation_utils import (
     geopose_enu_flu_to_ned_frd,
     slerp_quat,
 )
-from traj_estimation.msg import SyncedNavImu
+from traj_estimation_msgs.msg import SyncedNavImu
 
 @dataclass
 class GeoSample:
@@ -79,7 +79,7 @@ class InterpolateNode(Node):
         )
         self.declare_parameter('output_synced_topic', '/ap/state/synced')
         self.declare_parameter('output_frame_id', 'base_link_ned')
-        self.declare_parameter('publish_rate_hz', 50.0)
+        self.declare_parameter('publish_rate_hz', 150.0)
         self.declare_parameter('max_geo_buffer_sec', 5.0)
         self.declare_parameter('qos_depth', 100)
 
