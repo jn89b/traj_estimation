@@ -1,5 +1,8 @@
+from click import Tuple
+
 import numpy as np
 import casadi as ca
+import math
 
 def rot2d(psi):
     return np.array([[np.cos(psi), -np.sin(psi)],
@@ -149,3 +152,75 @@ def convertENUToNEDVector(x_enu:np.ndarray, y_enu:np.ndarray, z_enu:np.ndarray) 
     ned_y = x_enu
     ned_z = -z_enu
     return ned_x, ned_y, ned_z  
+
+def normalize_quat(q: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    x, y, z, w = q
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm == 0:
+        raise ValueError("Cannot normalize a zero-length quaternion")
+    return (x / norm, y / norm, z / norm, w / norm)
+
+def geopose_enu_flu_to_ned_frd(
+    q_enu_flu: Tuple[float, float, float, float],
+) -> Tuple[float, float, float, float]:
+    """
+    Convert ArduPilot DDS /ap/geopose/filtered orientation back to
+    ArduPilot-native NED world frame / FRD body frame.
+
+    Input and output use ROS Quaternion field order:
+        (x, y, z, w)
+    """
+    x_enu, y_enu, z_enu, w_enu = normalize_quat(q_enu_flu)
+
+    s = math.sqrt(0.5)
+
+    # Exact inverse of AP_DDS_Client.cpp GeoPose conversion.
+    q_ned_frd = (
+        s * (x_enu + y_enu),  # x
+        s * (x_enu - y_enu),  # y
+        s * (w_enu - z_enu),  # z
+        s * (w_enu + z_enu),  # w
+    )
+
+    return normalize_quat(q_ned_frd)
+
+
+def slerp_quat(
+    q0: Tuple[float, float, float, float],
+    q1: Tuple[float, float, float, float],
+    t: float,
+) -> Tuple[float, float, float, float]:
+    x0, y0, z0, w0 = normalize_quat(q0)
+    x1, y1, z1, w1 = normalize_quat(q1)
+
+    dot = x0 * x1 + y0 * y1 + z0 * z1 + w0 * w1
+
+    if dot < 0.0:
+        x1, y1, z1, w1 = -x1, -y1, -z1, -w1
+        dot = -dot
+
+    if dot > 0.9995:
+        x = x0 + t * (x1 - x0)
+        y = y0 + t * (y1 - y0)
+        z = z0 + t * (z1 - z0)
+        w = w0 + t * (w1 - w0)
+        return normalize_quat((x, y, z, w))
+
+    theta_0 = math.acos(max(-1.0, min(1.0, dot)))
+    sin_theta_0 = math.sin(theta_0)
+
+    if abs(sin_theta_0) < 1e-12:
+        return (x0, y0, z0, w0)
+
+    theta = theta_0 * t
+    sin_theta = math.sin(theta)
+
+    s0 = math.cos(theta) - dot * sin_theta / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+
+    x = s0 * x0 + s1 * x1
+    y = s0 * y0 + s1 * y1
+    z = s0 * z0 + s1 * z1
+    w = s0 * w0 + s1 * w1
+
+    return normalize_quat((x, y, z, w))

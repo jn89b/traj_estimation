@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.5)
 
 #change name of package to this
-project(ros2_template_package)
+project(traj_estimation)
 # Default to C++14
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 14)
@@ -18,19 +18,13 @@ find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
-# rosidl_generate_interfaces(${PROJECT_NAME}
-#   "msg/Telem.msg"
-#   "msg/CtlTraj.msg"
-
-#   "srv/AddTwoInts.srv"
-#   "srv/SetArmDisarm.srv"
-#   "srv/SetGoal.srv"
-#   "srv/SetUASType.srv"
-#   "srv/SetTakeOff.srv"
-#   # "srv/getGSInfo.srv"
-#  )
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/SyncedNavImu.msg"
+  DEPENDENCIES std_msgs sensor_msgs
+)
 
 # Include Cpp "include" directory
 include_directories(include)
@@ -50,15 +44,14 @@ install(TARGETS
 ament_python_install_package(${PROJECT_NAME})
 # Install Python executables
 install(PROGRAMS
-  scripts/pub_example.py
-  scripts/sub_example.py
-  scripts/goal_vis.py
-  scripts/target_estimator.py
-  scripts/guidance_publisher.py
+  scripts/interpolate_node.py
+  scripts/prediction_node.py
   # scripts/client_member_function.py
   # scripts/service_member_function.py
   DESTINATION lib/${PROJECT_NAME}
 )
+
+ament_export_dependencies(rosidl_default_runtime)
 ament_package()
 
 ##tests 
