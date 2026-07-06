@@ -43,6 +43,7 @@ ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS
   scripts/interpolate_node.py
   scripts/prediction_node.py
+  scripts/logger_node.py
   # scripts/client_member_function.py
   # scripts/service_member_function.py
   DESTINATION lib/${PROJECT_NAME}
