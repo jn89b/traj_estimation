@@ -1,106 +1,132 @@
 #!/usr/bin/env python3
-"""Interpolate low-rate GeoPose onto high-rate IMU time.
+"""Stream a fixed-rate Inspyre-compatible navigation + IMU topic.
 
-This node fuses two asynchronous streams:
-1) ``/ap/geopose/filtered`` (lower rate pose in geodetic coordinates), and
-2) ``/ap/imu/experimental/data`` (higher rate IMU).
+This node is the live equivalent of the batch path:
 
-Workflow:
-- Buffer incoming GeoPose samples with timestamps.
-- Convert GeoPose orientation from ENU/FLU to NED/FRD once at ingest.
-- On each IMU message, interpolate the two surrounding GeoPose samples to the
-    IMU timestamp (linear for lat/lon/alt, SLERP for quaternion).
-- Publish the latest synchronized IMU + interpolated GeoPose at a controlled
-    output rate.
+    Pose -> Pose.r_e_eb -> np.interp(ECEF) -> quaternion.slerp
+         -> ecef_to_ned -> Pose
+
+Unlike a timer that republishes the latest cached message, this node creates a
+fixed output-time grid (150 Hz by default). For every grid timestamp it:
+
+1. Linearly interpolates position in ECEF with ``np.interp``.
+2. SLERPs the GeoPose attitude with ``quaternion.slerp``.
+3. Linearly interpolates gyro and accelerometer values from bracketing IMUs.
+4. Publishes the interpolated Inspyre attitude ``q_nb`` in the output IMU
+   orientation field, using standard ROS ``x,y,z,w`` storage.
+5. Publishes exactly one GeoPose, IMU, and SyncedNavImu message.
+
+True interpolation requires future endpoints, so output is delayed by roughly
+one GeoPose period plus at most one IMU period. At 30 Hz GeoPose and 200 Hz
+IMU this is typically under about 40 ms.
 """
+
+from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Optional, Tuple
+from typing import Deque, Optional, Tuple, TypeVar
 
+import numpy as np
+import quaternion
 import rclpy
 from geographic_msgs.msg import GeoPoseStamped
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Imu
-from traj_estimation.rotation_utils import (
-    geopose_enu_flu_to_ned_frd,
-    slerp_quat,
-)
+
+# Same Inspyre APIs used by the original batch interpolation function.
+from traj_estimation.inspyre.states import Pose
+from traj_estimation.inspyre.earth import ecef_to_ned
+
+from traj_estimation.rotation_utils import geopose_enu_flu_to_ned_frd
 from traj_estimation_msgs.msg import SyncedNavImu
 
-@dataclass
-class GeoSample:
-    """Buffered geopose sample stored in interpolation-friendly form.
 
-    The quaternion is stored in NED/FRD after conversion so interpolation uses
-    the same frame that is later published.
-    """
+NSEC_PER_SEC = 1_000_000_000
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class GeoSample:
+    """One filtered GeoPose stored through the Inspyre Pose API."""
 
     stamp_ns: int
-    lat: float
-    lon: float
-    alt: float
-    quat: Tuple[float, float, float, float]  # NED/FRD, ROS field order x,y,z,w
+    time_s: float
+    pose: Pose
+    r_e_eb: np.ndarray
+    q_nb: quaternion.quaternion
+
+
+@dataclass(frozen=True)
+class ImuSample:
+    """One raw IMU message with its source timestamp."""
+
+    stamp_ns: int
+    msg: Imu
+
 
 class InterpolateNode(Node):
-    """ROS 2 node that time-aligns GeoPose with IMU and republishes both.
-
-    The node keeps a short history of GeoPose samples and computes an
-    interpolated GeoPose for each IMU timestamp. Publishing is timer-driven so
-    downstream consumers receive data at a predictable rate.
-    """
+    """Resample filtered GeoPose and IMU onto one fixed-rate timeline."""
 
     def __init__(self) -> None:
-        """Initialize parameters, subscriptions, publishers, and timer.
+        super().__init__("interpolate_node")
 
-        Input parameters (ROS params):
-            imu_topic (str): IMU input topic.
-            geopose_topic (str): Filtered GeoPose input topic.
-            output_imu_topic (str): Republished synchronized IMU topic.
-            output_geopose_topic (str): Interpolated GeoPose output topic.
-            output_synced_topic (str): Combined nav+IMU synchronized output.
-            output_frame_id (str): Frame id set on published GeoPose.
-            publish_rate_hz (float): Controlled output publish rate.
-            max_geo_buffer_sec (float): Max age for stored GeoPose samples.
-            qos_depth (int): QoS queue depth for pubs/subs.
-        """
-        super().__init__('interpolate_node')
-
-        self.declare_parameter('imu_topic', '/ap/imu/experimental/data')
-        self.declare_parameter('geopose_topic', '/ap/geopose/filtered')
+        self.declare_parameter("imu_topic", "/ap/imu/experimental/data")
+        self.declare_parameter("geopose_topic", "/ap/geopose/filtered")
         self.declare_parameter(
-            'output_imu_topic',
-            '/ap/imu/experimental/data/synced',
+            "output_imu_topic",
+            "/ap/imu/experimental/data/resampled",
         )
         self.declare_parameter(
-            'output_geopose_topic',
-            '/ap/geopose/filtered/interpolated_ned',
+            "output_geopose_topic",
+            "/ap/geopose/filtered/interpolated_ned",
         )
-        self.declare_parameter('output_synced_topic', '/ap/state/synced')
-        self.declare_parameter('output_frame_id', 'base_link_ned')
-        self.declare_parameter('publish_rate_hz', 150.0)
-        self.declare_parameter('max_geo_buffer_sec', 5.0)
-        self.declare_parameter('qos_depth', 100)
+        self.declare_parameter(
+            "output_synced_topic",
+            "/ap/state/synced",
+        )
+        # ``GeoPoseStamped`` contains global LLA plus a local-navigation
+        # attitude.  This label tells downstream consumers that the published
+        # attitude is q_nb (body FRD -> local NED), not ROS ENU/FLU.
+        self.declare_parameter("output_frame_id", "ned")
+        # IMU vectors remain in the physical ArduPilot body frame: FRD.
+        self.declare_parameter("output_imu_frame_id", "base_link_frd")
+        self.declare_parameter("output_rate_hz", 150.0)
+        self.declare_parameter("max_buffer_sec", 2.0)
+        self.declare_parameter("qos_depth", 300)
 
-        imu_topic = self.get_parameter('imu_topic').value
-        geopose_topic = self.get_parameter('geopose_topic').value
+        imu_topic = str(self.get_parameter("imu_topic").value)
+        geopose_topic = str(self.get_parameter("geopose_topic").value)
+        self.output_imu_topic = str(
+            self.get_parameter("output_imu_topic").value
+        )
+        self.output_geopose_topic = str(
+            self.get_parameter("output_geopose_topic").value
+        )
+        self.output_synced_topic = str(
+            self.get_parameter("output_synced_topic").value
+        )
+        self.output_frame_id = str(
+            self.get_parameter("output_frame_id").value
+        )
+        self.output_imu_frame_id = str(
+            self.get_parameter("output_imu_frame_id").value
+        )
+        self.output_rate_hz = float(
+            self.get_parameter("output_rate_hz").value
+        )
+        self.max_buffer_sec = float(
+            self.get_parameter("max_buffer_sec").value
+        )
+        qos_depth = int(self.get_parameter("qos_depth").value)
 
-        self.output_imu_topic = self.get_parameter('output_imu_topic').value
-        self.output_geopose_topic = (
-            self.get_parameter('output_geopose_topic').value
-        )
-        self.output_synced_topic = (
-            self.get_parameter('output_synced_topic').value
-        )
-        self.output_frame_id = self.get_parameter('output_frame_id').value
-        self.publish_rate_hz = float(
-            self.get_parameter('publish_rate_hz').value
-        )
-        self.max_geo_buffer_sec = float(
-            self.get_parameter('max_geo_buffer_sec').value
-        )
-        qos_depth = int(self.get_parameter('qos_depth').value)
+        if self.output_rate_hz <= 0.0:
+            raise ValueError("output_rate_hz must be > 0")
+        if self.max_buffer_sec <= 0.0:
+            raise ValueError("max_buffer_sec must be > 0")
+
+        self.period_ns = NSEC_PER_SEC / self.output_rate_hz
 
         qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -109,8 +135,13 @@ class InterpolateNode(Node):
         )
 
         self.geo_buffer: Deque[GeoSample] = deque()
-        self.latest_imu_for_pub: Optional[Imu] = None
-        self.latest_geo_for_pub: Optional[GeoPoseStamped] = None
+        self.imu_buffer: Deque[ImuSample] = deque()
+        self.last_geo_stamp_ns: Optional[int] = None
+        self.last_imu_stamp_ns: Optional[int] = None
+
+        # The grid starts only after both streams have a valid first sample.
+        self.grid_anchor_ns: Optional[int] = None
+        self.grid_index = 0
 
         self.create_subscription(Imu, imu_topic, self.imu_cb, qos)
         self.create_subscription(
@@ -120,11 +151,7 @@ class InterpolateNode(Node):
             qos,
         )
 
-        self.imu_pub = self.create_publisher(
-            Imu,
-            self.output_imu_topic,
-            qos,
-        )
+        self.imu_pub = self.create_publisher(Imu, self.output_imu_topic, qos)
         self.geo_pub = self.create_publisher(
             GeoPoseStamped,
             self.output_geopose_topic,
@@ -136,227 +163,462 @@ class InterpolateNode(Node):
             qos,
         )
 
-        timer_period = 1.0 / max(self.publish_rate_hz, 1e-3)
-        self.publish_timer = self.create_timer(
-            timer_period,
-            self.publish_cb,
-        )
+        self._validate_ned_conversion()
 
         self.get_logger().info(
-            f'Interpolating {geopose_topic} to IMU time from {imu_topic}; '
-            f'converting GeoPose orientation to NED/FRD; publishing at '
-            f'{self.publish_rate_hz:.2f} Hz to '
-            f'{self.output_geopose_topic}, {self.output_imu_topic}, and '
-            f'{self.output_synced_topic}'
+            f"Fixed-rate Inspyre NED/FRD interpolation enabled at "
+            f"{self.output_rate_hz:.3f} Hz: {geopose_topic} + {imu_topic} "
+            f"-> {self.output_synced_topic}"
         )
 
-    def _stamp_to_ns(self, sec: int, nanosec: int) -> int:
-        """Convert ROS 2 Time fields into integer nanoseconds.
+    @staticmethod
+    def _stamp_to_ns(sec: int, nanosec: int) -> int:
+        return int(sec) * NSEC_PER_SEC + int(nanosec)
 
-        Args:
-            sec: Seconds component of ROS time.
-            nanosec: Nanoseconds component of ROS time.
+    @staticmethod
+    def _set_stamp(header, stamp_ns: int) -> None:
+        header.stamp.sec = int(stamp_ns // NSEC_PER_SEC)
+        header.stamp.nanosec = int(stamp_ns % NSEC_PER_SEC)
 
-        Returns:
-            Timestamp expressed as total nanoseconds.
+    @staticmethod
+    def _xyzw_to_quaternion(
+        xyzw: Tuple[float, float, float, float],
+    ) -> quaternion.quaternion:
+        """Convert ROS XYZW storage to numpy-quaternion WXYZ storage."""
+        x, y, z, w = xyzw
+        q = quaternion.quaternion(float(w), float(x), float(y), float(z))
+        if abs(q) < 1e-12:
+            raise ValueError("zero-norm quaternion")
+        return q.normalized()
+
+    @staticmethod
+    def _quaternion_to_xyzw(
+        q: quaternion.quaternion,
+    ) -> Tuple[float, float, float, float]:
+        q = q.normalized()
+        return float(q.x), float(q.y), float(q.z), float(q.w)
+
+    def _validate_ned_conversion(self) -> None:
+        """Fail fast if the ENU/FLU -> NED/FRD helper has wrong semantics.
+
+        ArduPilot emits a level vehicle pointing north on ``/ap/geopose/filtered``
+        as the ROS ENU/FLU quaternion [x, y, z, w] =
+        [0, 0, sqrt(1/2), sqrt(1/2)].  In Inspyre's required q_nb convention
+        (body FRD -> navigation NED), the same physical attitude is identity.
         """
-        return int(sec) * 1_000_000_000 + int(nanosec)
+        half_sqrt_2 = float(np.sqrt(0.5))
+        q_xyzw = geopose_enu_flu_to_ned_frd(
+            (0.0, 0.0, half_sqrt_2, half_sqrt_2)
+        )
+        q_nb = self._xyzw_to_quaternion(q_xyzw)
+        identity = quaternion.quaternion(1.0, 0.0, 0.0, 0.0)
+        # q and -q represent the same attitude.
+        if abs(float(np.dot(quaternion.as_float_array(q_nb),
+                            quaternion.as_float_array(identity)))) < 1.0 - 1e-6:
+            raise RuntimeError(
+                "geopose_enu_flu_to_ned_frd does not produce q_nb identity "
+                "for level/north input; do not run with mixed frame semantics."
+            )
 
-    def geopose_cb(self, msg: GeoPoseStamped) -> None:
-        """Store GeoPose sample in buffer after frame conversion.
+    def _attach_ned_attitude(
+        self,
+        imu: Imu,
+        q_nb: quaternion.quaternion,
+    ) -> None:
+        """Put Inspyre's q_nb in output IMU orientation as standard ROS XYZW.
 
-        Orientation is converted from ENU/FLU to NED/FRD at ingest time. Old
-        samples are dropped to keep memory bounded and interpolation local.
-
-        Args:
-            msg: Incoming filtered GeoPose sample.
+        ``q_nb`` rotates a body-FRD vector into the local NED navigation frame.
+        Acceleration and gyro fields remain body-FRD, which is the convention
+        expected by Inspyre's inertial-navigation routines.
         """
-        stamp = msg.header.stamp
-        stamp_ns = self._stamp_to_ns(stamp.sec, stamp.nanosec)
+        qx, qy, qz, qw = self._quaternion_to_xyzw(q_nb)
+        imu.header.frame_id = self.output_imu_frame_id
+        imu.orientation.x = qx
+        imu.orientation.y = qy
+        imu.orientation.z = qz
+        imu.orientation.w = qw
+        # GeoPose does not carry an attitude covariance.  ROS uses an all-zero
+        # covariance to mean "unknown covariance" (not zero uncertainty).
+        imu.orientation_covariance = [0.0] * 9
 
+    def _geopose_to_sample(self, msg: GeoPoseStamped) -> Optional[GeoSample]:
+        """Construct the same Inspyre Pose representation used offline."""
+        stamp_ns = self._stamp_to_ns(
+            msg.header.stamp.sec,
+            msg.header.stamp.nanosec,
+        )
         if stamp_ns <= 0:
-            stamp_ns = self.get_clock().now().nanoseconds
+            self.get_logger().warn("Dropping GeoPose with zero timestamp.")
+            return None
 
-        quat_enu = (
+        lla_deg = np.array(
+            [
+                msg.pose.position.latitude,
+                msg.pose.position.longitude,
+                msg.pose.position.altitude,
+            ],
+            dtype=float,
+        )
+
+        # Keep the existing node's conversion before using Inspyre Pose/q_nb.
+        q_enu_flu_xyzw = (
             msg.pose.orientation.x,
             msg.pose.orientation.y,
             msg.pose.orientation.z,
             msg.pose.orientation.w,
         )
+        q_ned_frd_xyzw = geopose_enu_flu_to_ned_frd(q_enu_flu_xyzw)
 
-        # Convert once here, before interpolation.
-        quat_ned = geopose_enu_flu_to_ned_frd(quat_enu)
-
-        self.geo_buffer.append(
-            GeoSample(
-                stamp_ns=stamp_ns,
-                lat=msg.pose.position.latitude,
-                lon=msg.pose.position.longitude,
-                alt=msg.pose.position.altitude,
-                quat=quat_ned,
-            )
-        )
-
-        now_ns = self.get_clock().now().nanoseconds
-        min_keep_ns = now_ns - int(
-            self.max_geo_buffer_sec * 1_000_000_000
-        )
-
-        while (
-            len(self.geo_buffer) > 2
-            and self.geo_buffer[1].stamp_ns < min_keep_ns
-        ):
-            self.geo_buffer.popleft()
-
-    def _interpolate_geo(self, target_ns: int) -> Optional[GeoPoseStamped]:
-        """Interpolate buffered GeoPose to ``target_ns``.
-
-        If ``target_ns`` lies outside the buffer, the nearest endpoint sample is
-        used. Inside the buffer, position is linearly interpolated and attitude
-        uses spherical linear interpolation (SLERP).
-
-        Args:
-            target_ns: Timestamp to interpolate to, in nanoseconds.
-
-        Returns:
-            Interpolated GeoPoseStamped at ``target_ns`` if data is available,
-            otherwise ``None``.
-        """
-        if not self.geo_buffer:
+        try:
+            q_nb = self._xyzw_to_quaternion(q_ned_frd_xyzw)
+        except ValueError as exc:
+            self.get_logger().warn(f"Dropping GeoPose: {exc}")
             return None
 
-        if len(self.geo_buffer) == 1:
-            return self._build_geo_msg(target_ns, self.geo_buffer[0])
+        time_s = stamp_ns / float(NSEC_PER_SEC)
+        pose = Pose(lla_deg, q_nb, time_s, radians=False)
 
-        samples = self.geo_buffer
+        return GeoSample(
+            stamp_ns=stamp_ns,
+            time_s=time_s,
+            pose=pose,
+            r_e_eb=np.asarray(pose.r_e_eb, dtype=float),
+            q_nb=pose.q_nb.normalized(),
+        )
 
-        if target_ns <= samples[0].stamp_ns:
-            return self._build_geo_msg(target_ns, samples[0])
+    def _target_stamp_ns(self) -> int:
+        """Return the next fixed-rate output timestamp without drift."""
+        assert self.grid_anchor_ns is not None
+        return int(round(self.grid_anchor_ns + self.grid_index * self.period_ns))
 
-        if target_ns >= samples[-1].stamp_ns:
-            return self._build_geo_msg(target_ns, samples[-1])
+    def _initialize_grid_if_ready(self) -> bool:
+        """Anchor the fixed-rate grid once both source streams have started."""
+        if self.grid_anchor_ns is not None:
+            return True
+        if not self.geo_buffer or not self.imu_buffer:
+            return False
 
-        for i in range(len(samples) - 1):
-            a = samples[i]
-            b = samples[i + 1]
+        self.grid_anchor_ns = max(
+            self.geo_buffer[0].stamp_ns,
+            self.imu_buffer[0].stamp_ns,
+        )
+        self.grid_index = 0
+        self.get_logger().info(
+            "Output grid anchored at "
+            f"{self.grid_anchor_ns / NSEC_PER_SEC:.9f} s."
+        )
+        return True
 
-            if a.stamp_ns <= target_ns <= b.stamp_ns:
-                dt = b.stamp_ns - a.stamp_ns
-
-                if dt <= 0:
-                    return self._build_geo_msg(target_ns, a)
-
-                t = (target_ns - a.stamp_ns) / float(dt)
-
-                lat = a.lat + t * (b.lat - a.lat)
-                lon = a.lon + t * (b.lon - a.lon)
-                alt = a.alt + t * (b.alt - a.alt)
-                q_ned = slerp_quat(a.quat, b.quat, t)
-
-                out = GeoPoseStamped()
-                out.header.stamp.sec = int(target_ns // 1_000_000_000)
-                out.header.stamp.nanosec = int(target_ns % 1_000_000_000)
-                out.header.frame_id = self.output_frame_id
-
-                out.pose.position.latitude = lat
-                out.pose.position.longitude = lon
-                out.pose.position.altitude = alt
-
-                out.pose.orientation.x = q_ned[0]
-                out.pose.orientation.y = q_ned[1]
-                out.pose.orientation.z = q_ned[2]
-                out.pose.orientation.w = q_ned[3]
-
-                return out
-
-        return None
-
-    def _build_geo_msg(
-        self,
+    @staticmethod
+    def _bracket(
+        samples: Deque[T],
         target_ns: int,
-        sample: GeoSample,
-    ) -> GeoPoseStamped:
-        """Build output GeoPoseStamped from one buffered sample.
+    ) -> Optional[Tuple[T, T]]:
+        """Return source samples that bracket ``target_ns``.
 
-        Args:
-            target_ns: Timestamp to assign to output message.
-            sample: GeoSample values copied into output fields.
-
-        Returns:
-            GeoPoseStamped populated from ``sample`` and ``target_ns``.
+        The deque must contain objects with a ``stamp_ns`` attribute and be
+        sorted in ascending timestamp order. Samples already older than the
+        current target are discarded, but the left endpoint is retained.
         """
-        out = GeoPoseStamped()
+        while len(samples) >= 2 and samples[1].stamp_ns <= target_ns:
+            samples.popleft()
 
-        out.header.stamp.sec = int(target_ns // 1_000_000_000)
-        out.header.stamp.nanosec = int(target_ns % 1_000_000_000)
-        out.header.frame_id = self.output_frame_id
+        if not samples:
+            return None
+        if target_ns < samples[0].stamp_ns:
+            return None
 
-        out.pose.position.latitude = sample.lat
-        out.pose.position.longitude = sample.lon
-        out.pose.position.altitude = sample.alt
+        if len(samples) == 1:
+            if target_ns == samples[0].stamp_ns:
+                return samples[0], samples[0]
+            return None
 
-        out.pose.orientation.x = sample.quat[0]
-        out.pose.orientation.y = sample.quat[1]
-        out.pose.orientation.z = sample.quat[2]
-        out.pose.orientation.w = sample.quat[3]
+        return samples[0], samples[1]
 
+    @staticmethod
+    def _fraction(a_ns: int, b_ns: int, target_ns: int) -> float:
+        """Return interpolation fraction, including the exact endpoint case."""
+        if b_ns <= a_ns:
+            return 0.0
+        return float(np.clip(
+            (target_ns - a_ns) / float(b_ns - a_ns),
+            0.0,
+            1.0,
+        ))
+
+    def _interpolate_pose(
+        self,
+        a: GeoSample,
+        b: GeoSample,
+        target_ns: int,
+    ) -> Pose:
+        """Interpolate a Pose through the same APIs as Inspyre's batch path."""
+        target_s = target_ns / float(NSEC_PER_SEC)
+
+        if a.stamp_ns == b.stamp_ns:
+            return Pose(
+                np.array([a.pose.lat, a.pose.lon, a.pose.alt]),
+                a.q_nb,
+                target_s,
+                radians=True,
+            )
+
+        time_pair = np.array([a.time_s, b.time_s], dtype=float)
+
+        # Keep the requested ``np.interp`` behavior, but operate in ECEF.``
+        x = np.interp(target_s, time_pair, [a.r_e_eb[0], b.r_e_eb[0]])
+        y = np.interp(target_s, time_pair, [a.r_e_eb[1], b.r_e_eb[1]])
+        z = np.interp(target_s, time_pair, [a.r_e_eb[2], b.r_e_eb[2]])
+
+        q_nb = quaternion.slerp(
+            a.q_nb,
+            b.q_nb,
+            a.time_s,
+            b.time_s,
+            target_s,
+        ).normalized()
+
+        # Inspyre retains this historical function name; it returns LLA radians.
+        lla_rad = ecef_to_ned(np.array([x, y, z], dtype=float))
+        return Pose(lla_rad, q_nb, target_s, radians=True)
+
+    def _interpolate_imu(
+        self,
+        a: ImuSample,
+        b: ImuSample,
+        target_ns: int,
+    ) -> Imu:
+        """Resample the IMU values onto the same output timestamp.
+
+        Gyro and accelerometer values are linearly interpolated in ArduPilot's
+        body-FRD axes.  Attitude is injected later from the synchronized
+        Inspyre q_nb pose, so this method intentionally ignores the raw IMU
+        orientation encoding.
+        """
+        u = self._fraction(a.stamp_ns, b.stamp_ns, target_ns)
+        a_msg = a.msg
+        b_msg = b.msg
+
+        out = Imu()
+        self._set_stamp(out.header, target_ns)
+        out.header.frame_id = self.output_imu_frame_id
+
+        gyro_a = np.array(
+            [
+                a_msg.angular_velocity.x,
+                a_msg.angular_velocity.y,
+                a_msg.angular_velocity.z,
+            ],
+            dtype=float,
+        )
+        gyro_b = np.array(
+            [
+                b_msg.angular_velocity.x,
+                b_msg.angular_velocity.y,
+                b_msg.angular_velocity.z,
+            ],
+            dtype=float,
+        )
+        accel_a = np.array(
+            [
+                a_msg.linear_acceleration.x,
+                a_msg.linear_acceleration.y,
+                a_msg.linear_acceleration.z,
+            ],
+            dtype=float,
+        )
+        accel_b = np.array(
+            [
+                b_msg.linear_acceleration.x,
+                b_msg.linear_acceleration.y,
+                b_msg.linear_acceleration.z,
+            ],
+            dtype=float,
+        )
+
+        gyro = gyro_a + u * (gyro_b - gyro_a)
+        accel = accel_a + u * (accel_b - accel_a)
+
+        out.angular_velocity.x = float(gyro[0])
+        out.angular_velocity.y = float(gyro[1])
+        out.angular_velocity.z = float(gyro[2])
+        out.linear_acceleration.x = float(accel[0])
+        out.linear_acceleration.y = float(accel[1])
+        out.linear_acceleration.z = float(accel[2])
+
+        # Do not propagate /ap/imu/experimental/data.orientation here.
+        # ArduPilot publishes q_bn (NED -> body FRD) in q1,q2,q3,q4 order
+        # stored in ROS fields x,y,z,w.  The output instead receives q_nb from
+        # the interpolated Inspyre Pose in _attach_ned_attitude().
+
+        # The model does not consume covariance, but retain source metadata.
+        out.angular_velocity_covariance = a_msg.angular_velocity_covariance
+        out.linear_acceleration_covariance = a_msg.linear_acceleration_covariance
         return out
 
-    def imu_cb(self, msg: Imu) -> None:
-        """Process IMU sample and compute time-matched GeoPose.
+    def _pose_to_geopose_msg(
+        self,
+        pose: Pose,
+        stamp_ns: int,
+    ) -> GeoPoseStamped:
+        """Serialize the interpolated pose with standard-XYZW q_nb attitude.
 
-        This callback does not publish directly. It updates the latest aligned
-        pair, which is published by ``publish_cb`` at the configured rate.
-
-        Args:
-            msg: Incoming IMU sample used as interpolation time reference.
+        LLA stays WGS-84 geodetic.  Only the attitude convention is local NED
+        navigation with FRD body axes, as required by Inspyre.
         """
-        stamp = msg.header.stamp
-        target_ns = self._stamp_to_ns(stamp.sec, stamp.nanosec)
+        qx, qy, qz, qw = self._quaternion_to_xyzw(pose.q_nb)
 
-        if target_ns <= 0:
-            target_ns = self.get_clock().now().nanoseconds
+        out = GeoPoseStamped()
+        self._set_stamp(out.header, stamp_ns)
+        out.header.frame_id = self.output_frame_id
+        out.pose.position.latitude = float(np.rad2deg(pose.lat))
+        out.pose.position.longitude = float(np.rad2deg(pose.lon))
+        out.pose.position.altitude = float(pose.alt)
+        out.pose.orientation.x = qx
+        out.pose.orientation.y = qy
+        out.pose.orientation.z = qz
+        out.pose.orientation.w = qw
+        return out
 
-        interp_geo = self._interpolate_geo(target_ns)
-
-        if interp_geo is None:
-            return
-
-        self.latest_imu_for_pub = msg
-        self.latest_geo_for_pub = interp_geo
-
-    def publish_cb(self) -> None:
-        """Publish most recent synchronized IMU and interpolated GeoPose.
-
-        This method publishes only when both cached messages are available.
-        """
-        if (
-            self.latest_imu_for_pub is None
-            or self.latest_geo_for_pub is None
-        ):
-            return
-
-        self.imu_pub.publish(self.latest_imu_for_pub)
-        self.geo_pub.publish(self.latest_geo_for_pub)
+    def _publish_pair(self, imu: Imu, geo: GeoPoseStamped) -> None:
+        """Publish one exact-rate NED/FRD time-aligned output sample."""
+        self.imu_pub.publish(imu)
+        self.geo_pub.publish(geo)
 
         synced = SyncedNavImu()
-        synced.header = self.latest_geo_for_pub.header
-        synced.latitude = self.latest_geo_for_pub.pose.position.latitude
-        synced.longitude = self.latest_geo_for_pub.pose.position.longitude
-        synced.altitude = self.latest_geo_for_pub.pose.position.altitude
-        synced.imu = self.latest_imu_for_pub
+        synced.header = geo.header
+        synced.latitude = geo.pose.position.latitude
+        synced.longitude = geo.pose.position.longitude
+        synced.altitude = geo.pose.position.altitude
+        synced.imu = imu
         self.synced_pub.publish(synced)
+
+    def _advance_grid_past_unrecoverable_gap(self) -> bool:
+        """Skip timestamps permanently older than the remaining source buffers."""
+        if (
+            self.grid_anchor_ns is None
+            or not self.geo_buffer
+            or not self.imu_buffer
+        ):
+            return False
+
+        target_ns = self._target_stamp_ns()
+        earliest_possible_ns = max(
+            self.geo_buffer[0].stamp_ns,
+            self.imu_buffer[0].stamp_ns,
+        )
+        if target_ns >= earliest_possible_ns:
+            return False
+
+        old_index = self.grid_index
+        self.grid_index = int(np.ceil(
+            (earliest_possible_ns - self.grid_anchor_ns) / self.period_ns
+        ))
+        self.grid_index = max(self.grid_index, old_index)
+        return self.grid_index != old_index
+
+    def _process_ready_outputs(self) -> None:
+        """Publish all fixed-grid outputs currently bracketed by both streams."""
+        if not self._initialize_grid_if_ready():
+            return
+
+        while True:
+            if self._advance_grid_past_unrecoverable_gap():
+                # A PredictionNode should reset its sequence after this gap.
+                continue
+
+            target_ns = self._target_stamp_ns()
+            geo_pair = self._bracket(self.geo_buffer, target_ns)
+            imu_pair = self._bracket(self.imu_buffer, target_ns)
+
+            # The next target still needs a future GeoPose and/or IMU endpoint.
+            if geo_pair is None or imu_pair is None:
+                return
+
+            try:
+                interp_pose = self._interpolate_pose(
+                    geo_pair[0],
+                    geo_pair[1],
+                    target_ns,
+                )
+                interp_imu = self._interpolate_imu(
+                    imu_pair[0],
+                    imu_pair[1],
+                    target_ns,
+                )
+                self._attach_ned_attitude(interp_imu, interp_pose.q_nb)
+            except (ValueError, FloatingPointError) as exc:
+                self.get_logger().warn(
+                    f"Skipping output at {target_ns}: {exc}"
+                )
+                self.grid_index += 1
+                continue
+
+            interp_geo = self._pose_to_geopose_msg(interp_pose, target_ns)
+            self._publish_pair(interp_imu, interp_geo)
+            self.grid_index += 1
+
+    @staticmethod
+    def _trim_buffer(
+        buffer: Deque[T],
+        newest_ns: int,
+        max_age_ns: int,
+    ) -> None:
+        """Bound storage while retaining two source samples when available."""
+        min_keep_ns = newest_ns - max_age_ns
+        while len(buffer) > 2 and buffer[1].stamp_ns < min_keep_ns:
+            buffer.popleft()
+
+    def imu_cb(self, msg: Imu) -> None:
+        """Buffer an IMU sample and emit any newly bracketed grid timestamps."""
+        stamp_ns = self._stamp_to_ns(
+            msg.header.stamp.sec,
+            msg.header.stamp.nanosec,
+        )
+        if stamp_ns <= 0:
+            self.get_logger().warn("Dropping IMU with zero timestamp.")
+            return
+        if (
+            self.last_imu_stamp_ns is not None
+            and stamp_ns <= self.last_imu_stamp_ns
+        ):
+            self.get_logger().warn("Dropping non-monotonic IMU timestamp.")
+            return
+
+        self.last_imu_stamp_ns = stamp_ns
+        self.imu_buffer.append(ImuSample(stamp_ns=stamp_ns, msg=msg))
+        self._trim_buffer(
+            self.imu_buffer,
+            stamp_ns,
+            int(self.max_buffer_sec * NSEC_PER_SEC),
+        )
+        self._process_ready_outputs()
+
+    def geopose_cb(self, msg: GeoPoseStamped) -> None:
+        """Buffer a filtered GeoPose and emit any newly completed outputs."""
+        sample = self._geopose_to_sample(msg)
+        if sample is None:
+            return
+        if (
+            self.last_geo_stamp_ns is not None
+            and sample.stamp_ns <= self.last_geo_stamp_ns
+        ):
+            self.get_logger().warn("Dropping non-monotonic GeoPose timestamp.")
+            return
+
+        self.last_geo_stamp_ns = sample.stamp_ns
+        self.geo_buffer.append(sample)
+        self._trim_buffer(
+            self.geo_buffer,
+            sample.stamp_ns,
+            int(self.max_buffer_sec * NSEC_PER_SEC),
+        )
+        self._process_ready_outputs()
 
 
 def main(args=None) -> None:
-    """Entrypoint for the interpolation node process.
-
-    Args:
-        args: Optional ROS command-line arguments.
-    """
     rclpy.init(args=args)
     node = InterpolateNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -366,5 +628,5 @@ def main(args=None) -> None:
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
