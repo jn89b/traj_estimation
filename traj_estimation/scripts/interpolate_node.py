@@ -3,22 +3,24 @@
 
 This node is the live equivalent of the batch path:
 
-    Pose -> Pose.r_e_eb -> np.interp(ECEF) -> quaternion.slerp
+    Pose -> Pose.r_e_eb -> linear/CubicSpline(ECEF) -> quaternion.slerp
          -> ecef_to_ned -> Pose
 
 Unlike a timer that republishes the latest cached message, this node creates a
 fixed output-time grid (150 Hz by default). For every grid timestamp it:
 
-1. Linearly interpolates position in ECEF with ``np.interp``.
+1. Interpolates position in ECEF using either ``np.interp`` or a cached,
+   local four-knot ``CubicSpline``.
 2. SLERPs the GeoPose attitude with ``quaternion.slerp``.
 3. Linearly interpolates gyro and accelerometer values from bracketing IMUs.
 4. Publishes the interpolated Inspyre attitude ``q_nb`` in the output IMU
    orientation field, using standard ROS ``x,y,z,w`` storage.
 5. Publishes exactly one GeoPose, IMU, and SyncedNavImu message.
 
-True interpolation requires future endpoints, so output is delayed by roughly
-one GeoPose period plus at most one IMU period. At 30 Hz GeoPose and 200 Hz
-IMU this is typically under about 40 ms.
+True interpolation requires future endpoints. ``linear`` position mode is
+usually delayed by roughly one GeoPose period plus one IMU period (about 40 ms
+at 30 Hz GeoPose / 200 Hz IMU). ``cubic`` uses a four-knot local window and
+usually has about one additional GeoPose period of delay (about 70 ms total).
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from typing import Deque, Optional, Tuple, TypeVar
 
 import numpy as np
 import quaternion
+from scipy.interpolate import CubicSpline
 import rclpy
 from geographic_msgs.msg import GeoPoseStamped
 from rclpy.node import Node
@@ -66,6 +69,24 @@ class ImuSample:
     msg: Imu
 
 
+@dataclass(frozen=True)
+class CubicEcefSegment:
+    """Cached local cubic position spline for one completed GeoPose interval.
+
+    The spline uses four neighboring GeoPose samples ``g0, g1, g2, g3`` and is
+    evaluated only over the interior interval ``[g1, g2]``.  A segment is built
+    once when the newest GPS/GeoPose point makes that interval complete, then
+    reused for every 150 Hz output timestamp in that interval.
+    """
+
+    start_ns: int
+    end_ns: int
+    reference_time_s: float
+    spline_x: CubicSpline
+    spline_y: CubicSpline
+    spline_z: CubicSpline
+
+
 class InterpolateNode(Node):
     """Resample filtered GeoPose and IMU onto one fixed-rate timeline."""
 
@@ -93,6 +114,10 @@ class InterpolateNode(Node):
         # IMU vectors remain in the physical ArduPilot body frame: FRD.
         self.declare_parameter("output_imu_frame_id", "base_link_frd")
         self.declare_parameter("output_rate_hz", 150.0)
+        self.declare_parameter(
+            "position_interpolation",
+            "linear",
+        )  # "linear" or "cubic"
         self.declare_parameter("max_buffer_sec", 2.0)
         self.declare_parameter("qos_depth", 300)
 
@@ -116,6 +141,9 @@ class InterpolateNode(Node):
         self.output_rate_hz = float(
             self.get_parameter("output_rate_hz").value
         )
+        self.position_interpolation = str(
+            self.get_parameter("position_interpolation").value
+        ).strip().lower()
         self.max_buffer_sec = float(
             self.get_parameter("max_buffer_sec").value
         )
@@ -123,6 +151,10 @@ class InterpolateNode(Node):
 
         if self.output_rate_hz <= 0.0:
             raise ValueError("output_rate_hz must be > 0")
+        if self.position_interpolation not in {"linear", "cubic"}:
+            raise ValueError(
+                "position_interpolation must be 'linear' or 'cubic'"
+            )
         if self.max_buffer_sec <= 0.0:
             raise ValueError("max_buffer_sec must be > 0")
 
@@ -139,7 +171,12 @@ class InterpolateNode(Node):
         self.last_geo_stamp_ns: Optional[int] = None
         self.last_imu_stamp_ns: Optional[int] = None
 
-        # The grid starts only after both streams have a valid first sample.
+        # Cubic mode caches one spline for each completed interior GPS interval.
+        # This cache is updated only when a new GeoPose sample arrives.
+        self.cubic_segments: dict[Tuple[int, int], CubicEcefSegment] = {}
+
+        # The grid starts only after both streams have enough samples for the
+        # selected position interpolation method.
         self.grid_anchor_ns: Optional[int] = None
         self.grid_index = 0
 
@@ -167,8 +204,9 @@ class InterpolateNode(Node):
 
         self.get_logger().info(
             f"Fixed-rate Inspyre NED/FRD interpolation enabled at "
-            f"{self.output_rate_hz:.3f} Hz: {geopose_topic} + {imu_topic} "
-            f"-> {self.output_synced_topic}"
+            f"{self.output_rate_hz:.3f} Hz; "
+            f"position_mode={self.position_interpolation}: "
+            f"{geopose_topic} + {imu_topic} -> {self.output_synced_topic}"
         )
 
     @staticmethod
@@ -292,20 +330,33 @@ class InterpolateNode(Node):
         return int(round(self.grid_anchor_ns + self.grid_index * self.period_ns))
 
     def _initialize_grid_if_ready(self) -> bool:
-        """Anchor the fixed-rate grid once both source streams have started."""
+        """Anchor the fixed-rate grid once both source streams are usable.
+
+        Linear interpolation needs two GeoPose samples.  Local cubic mode needs
+        four samples and begins at the second knot, where the first completed
+        interior interval ``[g1, g2]`` can eventually be evaluated.
+        """
         if self.grid_anchor_ns is not None:
             return True
-        if not self.geo_buffer or not self.imu_buffer:
+
+        required_geo = 4 if self.position_interpolation == "cubic" else 2
+        if len(self.geo_buffer) < required_geo or len(self.imu_buffer) < 2:
             return False
 
+        geo_start = (
+            self.geo_buffer[1]
+            if self.position_interpolation == "cubic"
+            else self.geo_buffer[0]
+        )
         self.grid_anchor_ns = max(
-            self.geo_buffer[0].stamp_ns,
+            geo_start.stamp_ns,
             self.imu_buffer[0].stamp_ns,
         )
         self.grid_index = 0
         self.get_logger().info(
             "Output grid anchored at "
-            f"{self.grid_anchor_ns / NSEC_PER_SEC:.9f} s."
+            f"{self.grid_anchor_ns / NSEC_PER_SEC:.9f} s "
+            f"({self.position_interpolation} position mode)."
         )
         return True
 
@@ -346,29 +397,124 @@ class InterpolateNode(Node):
             1.0,
         ))
 
-    def _interpolate_pose(
+    def _find_geo_pair(
         self,
-        a: GeoSample,
-        b: GeoSample,
         target_ns: int,
-    ) -> Pose:
-        """Interpolate a Pose through the same APIs as Inspyre's batch path."""
+    ) -> Optional[Tuple[GeoSample, GeoSample]]:
+        """Return the two GeoPose samples that bracket ``target_ns``.
+
+        This lookup does not discard GPS history because cubic mode needs a
+        neighbor on either side of the active interpolation interval.
+        """
+        if len(self.geo_buffer) < 2:
+            return None
+
+        samples = self.geo_buffer
+        if (
+            target_ns < samples[0].stamp_ns
+            or target_ns > samples[-1].stamp_ns
+        ):
+            return None
+
+        for a, b in zip(samples, list(samples)[1:]):
+            if a.stamp_ns <= target_ns <= b.stamp_ns:
+                return a, b
+        return None
+
+    def _find_cubic_window(
+        self,
+        target_ns: int,
+    ) -> Optional[Tuple[GeoSample, GeoSample, GeoSample, GeoSample]]:
+        """Return ``g0,g1,g2,g3`` with target in the interior [g1, g2]."""
+        if len(self.geo_buffer) < 4:
+            return None
+
+        samples = list(self.geo_buffer)
+        for index in range(1, len(samples) - 2):
+            g0 = samples[index - 1]
+            g1 = samples[index]
+            g2 = samples[index + 1]
+            g3 = samples[index + 2]
+            if g1.stamp_ns <= target_ns <= g2.stamp_ns:
+                return g0, g1, g2, g3
+        return None
+
+    def _get_or_create_cubic_segment(
+        self,
+        g0: GeoSample,
+        g1: GeoSample,
+        g2: GeoSample,
+        g3: GeoSample,
+    ) -> CubicEcefSegment:
+        """Create one cached four-knot local ECEF CubicSpline when needed."""
+        key = (g1.stamp_ns, g2.stamp_ns)
+        cached = self.cubic_segments.get(key)
+        if cached is not None:
+            return cached
+
+        reference_time_s = g1.time_s
+        knot_times_s = np.array(
+            [g0.time_s, g1.time_s, g2.time_s, g3.time_s],
+            dtype=float,
+        ) - reference_time_s
+
+        if not np.all(np.diff(knot_times_s) > 0.0):
+            raise ValueError("GeoPose timestamps must be strictly increasing")
+
+        xyz = np.vstack(
+            [g0.r_e_eb, g1.r_e_eb, g2.r_e_eb, g3.r_e_eb]
+        )
+
+        # Default ``not-a-knot`` boundary conditions match CubicSpline(...) in
+        # the original offline Inspyre interpolation function.
+        segment = CubicEcefSegment(
+            start_ns=g1.stamp_ns,
+            end_ns=g2.stamp_ns,
+            reference_time_s=reference_time_s,
+            spline_x=CubicSpline(knot_times_s, xyz[:, 0]),
+            spline_y=CubicSpline(knot_times_s, xyz[:, 1]),
+            spline_z=CubicSpline(knot_times_s, xyz[:, 2]),
+        )
+        self.cubic_segments[key] = segment
+        return segment
+
+    def _interpolate_pose(self, target_ns: int) -> Optional[Pose]:
+        """Interpolate NED/FRD Pose with selected ECEF position method.
+
+        ``linear`` uses the two bracketing GeoPose samples.  ``cubic`` uses a
+        cached four-knot local CubicSpline, but only over its middle interval.
+        Attitude remains SLERP between the same two interval endpoints in both
+        modes, which is intentionally low-cost and stable in real time.
+        """
         target_s = target_ns / float(NSEC_PER_SEC)
 
-        if a.stamp_ns == b.stamp_ns:
-            return Pose(
-                np.array([a.pose.lat, a.pose.lon, a.pose.alt]),
-                a.q_nb,
-                target_s,
-                radians=True,
-            )
+        if self.position_interpolation == "linear":
+            pair = self._find_geo_pair(target_ns)
+            if pair is None:
+                return None
+            a, b = pair
+            if a.stamp_ns == b.stamp_ns:
+                return Pose(
+                    np.array([a.pose.lat, a.pose.lon, a.pose.alt]),
+                    a.q_nb,
+                    target_s,
+                    radians=True,
+                )
 
-        time_pair = np.array([a.time_s, b.time_s], dtype=float)
-
-        # Keep the requested ``np.interp`` behavior, but operate in ECEF.``
-        x = np.interp(target_s, time_pair, [a.r_e_eb[0], b.r_e_eb[0]])
-        y = np.interp(target_s, time_pair, [a.r_e_eb[1], b.r_e_eb[1]])
-        z = np.interp(target_s, time_pair, [a.r_e_eb[2], b.r_e_eb[2]])
+            time_pair = np.array([a.time_s, b.time_s], dtype=float)
+            x = np.interp(target_s, time_pair, [a.r_e_eb[0], b.r_e_eb[0]])
+            y = np.interp(target_s, time_pair, [a.r_e_eb[1], b.r_e_eb[1]])
+            z = np.interp(target_s, time_pair, [a.r_e_eb[2], b.r_e_eb[2]])
+        else:
+            window = self._find_cubic_window(target_ns)
+            if window is None:
+                return None
+            g0, a, b, g3 = window
+            segment = self._get_or_create_cubic_segment(g0, a, b, g3)
+            local_t = target_s - segment.reference_time_s
+            x = float(segment.spline_x(local_t))
+            y = float(segment.spline_y(local_t))
+            z = float(segment.spline_z(local_t))
 
         q_nb = quaternion.slerp(
             a.q_nb,
@@ -495,16 +641,24 @@ class InterpolateNode(Node):
 
     def _advance_grid_past_unrecoverable_gap(self) -> bool:
         """Skip timestamps permanently older than the remaining source buffers."""
-        if (
-            self.grid_anchor_ns is None
-            or not self.geo_buffer
-            or not self.imu_buffer
-        ):
+        if self.grid_anchor_ns is None or not self.imu_buffer:
             return False
+
+        required_geo = 4 if self.position_interpolation == "cubic" else 2
+        if len(self.geo_buffer) < required_geo:
+            return False
+
+        # Cubic evaluation cannot begin before the second GeoPose knot because
+        # it needs g0 before and g3 after the active [g1, g2] interval.
+        geo_earliest_ns = (
+            self.geo_buffer[1].stamp_ns
+            if self.position_interpolation == "cubic"
+            else self.geo_buffer[0].stamp_ns
+        )
 
         target_ns = self._target_stamp_ns()
         earliest_possible_ns = max(
-            self.geo_buffer[0].stamp_ns,
+            geo_earliest_ns,
             self.imu_buffer[0].stamp_ns,
         )
         if target_ns >= earliest_possible_ns:
@@ -528,19 +682,19 @@ class InterpolateNode(Node):
                 continue
 
             target_ns = self._target_stamp_ns()
-            geo_pair = self._bracket(self.geo_buffer, target_ns)
             imu_pair = self._bracket(self.imu_buffer, target_ns)
 
-            # The next target still needs a future GeoPose and/or IMU endpoint.
-            if geo_pair is None or imu_pair is None:
+            # The next target still needs a future IMU endpoint.
+            if imu_pair is None:
                 return
 
             try:
-                interp_pose = self._interpolate_pose(
-                    geo_pair[0],
-                    geo_pair[1],
-                    target_ns,
-                )
+                interp_pose = self._interpolate_pose(target_ns)
+                # The selected GeoPose method does not yet have enough future
+                # knots: wait rather than extrapolating or retimestamping stale
+                # GPS data.
+                if interp_pose is None:
+                    return
                 interp_imu = self._interpolate_imu(
                     imu_pair[0],
                     imu_pair[1],
@@ -563,10 +717,14 @@ class InterpolateNode(Node):
         buffer: Deque[T],
         newest_ns: int,
         max_age_ns: int,
+        minimum_samples: int = 2,
     ) -> None:
-        """Bound storage while retaining two source samples when available."""
+        """Bound storage while retaining enough source samples for the mode."""
         min_keep_ns = newest_ns - max_age_ns
-        while len(buffer) > 2 and buffer[1].stamp_ns < min_keep_ns:
+        while (
+            len(buffer) > minimum_samples
+            and buffer[1].stamp_ns < min_keep_ns
+        ):
             buffer.popleft()
 
     def imu_cb(self, msg: Imu) -> None:
@@ -608,11 +766,35 @@ class InterpolateNode(Node):
 
         self.last_geo_stamp_ns = sample.stamp_ns
         self.geo_buffer.append(sample)
+
+        # Cache only the newest completed local cubic interval.  This is the
+        # requested "keep the previous N points and update with the newest GPS"
+        # behavior: each new GPS point enables one new [g1, g2] spline segment.
+        if self.position_interpolation == "cubic" and len(self.geo_buffer) >= 4:
+            g0, g1, g2, g3 = list(self.geo_buffer)[-4:]
+            try:
+                self._get_or_create_cubic_segment(g0, g1, g2, g3)
+            except ValueError as exc:
+                self.get_logger().warn(f"Skipping cubic cache update: {exc}")
+
         self._trim_buffer(
             self.geo_buffer,
             sample.stamp_ns,
             int(self.max_buffer_sec * NSEC_PER_SEC),
+            minimum_samples=(
+                4 if self.position_interpolation == "cubic" else 2
+            ),
         )
+
+        # Prune spline cache entries that cannot be used with retained GPS data.
+        if self.geo_buffer:
+            keep_from_ns = self.geo_buffer[0].stamp_ns
+            self.cubic_segments = {
+                key: segment
+                for key, segment in self.cubic_segments.items()
+                if segment.end_ns >= keep_from_ns
+            }
+
         self._process_ready_outputs()
 
 
