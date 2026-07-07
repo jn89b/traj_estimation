@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Low-jitter real-time logger for synchronized navigation/IMU and RNN correction.
+Low-jitter real-time logger for synchronized navigation/IMU, RNN correction,
+and optional RNN input-window debug data.
 
 Design:
 - ROS callbacks only copy message values and enqueue records.
+- The optional model-input window log contains the exact flattened
+  Float32MultiArray supplied to the recurrent model.
 - A background writer thread batches JSONL writes.
 - File buffers flush periodically.
 - fsync runs periodically for crash/power-loss protection.
@@ -27,7 +30,7 @@ from typing import Any, Dict, Optional
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float32MultiArray, Float64MultiArray
 
 from traj_estimation_msgs.msg import SyncedNavImu
 
@@ -40,6 +43,16 @@ class RealtimeLoggerNode(Node):
 
         self.declare_parameter("synced_topic", "/ap/state/synced")
         self.declare_parameter("correction_topic", "/ap/state/correction")
+
+        # Produced by PredictionNode when publish_input_window:=true.
+        # This is the exact flattened [sequence_length, 13] input tensor
+        # supplied to the GRU/LSTM immediately before inference.
+        self.declare_parameter(
+            "model_input_window_topic",
+            "/ap/state/model_input_window",
+        )
+        self.declare_parameter("log_model_input_window", True)
+
         self.declare_parameter("output_dir", "/workspace/flight_logs")
         self.declare_parameter("run_name", "")
 
@@ -54,8 +67,16 @@ class RealtimeLoggerNode(Node):
         self.declare_parameter("shutdown_drain_timeout_s", 10.0)
         self.declare_parameter("stats_period_s", 5.0)
 
-        synced_topic = str(self.get_parameter("synced_topic").value)
-        correction_topic = str(self.get_parameter("correction_topic").value)
+        self.synced_topic = str(self.get_parameter("synced_topic").value)
+        self.correction_topic = str(
+            self.get_parameter("correction_topic").value
+        )
+        self.model_input_window_topic = str(
+            self.get_parameter("model_input_window_topic").value
+        )
+        self.log_model_input_window = bool(
+            self.get_parameter("log_model_input_window").value
+        )
 
         output_dir = Path(str(self.get_parameter("output_dir").value))
         run_name = str(self.get_parameter("run_name").value)
@@ -125,26 +146,42 @@ class RealtimeLoggerNode(Node):
 
         self.create_subscription(
             SyncedNavImu,
-            synced_topic,
+            self.synced_topic,
             self.synced_cb,
             qos,
         )
 
         self.create_subscription(
             Float64MultiArray,
-            correction_topic,
+            self.correction_topic,
             self.correction_cb,
             qos,
         )
 
+        if self.log_model_input_window:
+            self.create_subscription(
+                Float32MultiArray,
+                self.model_input_window_topic,
+                self.model_input_window_cb,
+                qos,
+            )
+
         self.create_timer(stats_period_s, self._report_stats)
 
+        logged_topics = [
+            self.synced_topic,
+            self.correction_topic,
+        ]
+        if self.log_model_input_window:
+            logged_topics.append(self.model_input_window_topic)
+
         self.get_logger().info(
-            f"Logging {synced_topic} and {correction_topic} to:\n"
-            f"  {self.log_path}\n"
-            f"queue_size={queue_size}, batch_size={self.batch_size}, "
-            f"flush_interval_s={self.flush_interval_s}, "
-            f"fsync_interval_s={self.fsync_interval_s}"
+            "Logging topics:\n"
+            + "".join(f"  {topic}\n" for topic in logged_topics)
+            + f"to:\n  {self.log_path}\n"
+            + f"queue_size={queue_size}, batch_size={self.batch_size}, "
+            + f"flush_interval_s={self.flush_interval_s}, "
+            + f"fsync_interval_s={self.fsync_interval_s}"
         )
 
     @staticmethod
@@ -208,7 +245,7 @@ class RealtimeLoggerNode(Node):
         imu = msg.imu
 
         self._enqueue(
-            "/ap/state/synced",
+            self.synced_topic,
             {
                 "message_stamp": self._header_stamp_dict(msg),
                 "imu_stamp": self._header_stamp_dict(imu),
@@ -243,8 +280,73 @@ class RealtimeLoggerNode(Node):
     def correction_cb(self, msg: Float64MultiArray) -> None:
         """Copy RNN correction output and enqueue it."""
         self._enqueue(
-            "/ap/state/correction",
+            self.correction_topic,
             {
+                "values": [
+                    self._finite_float_or_none(value)
+                    for value in msg.data
+                ],
+            },
+        )
+
+    @staticmethod
+    def _multiarray_layout_dict(
+        msg: Float32MultiArray,
+    ) -> Dict[str, Any]:
+        """Copy Float32MultiArray layout metadata into JSON-safe values."""
+        return {
+            "data_offset": int(msg.layout.data_offset),
+            "dimensions": [
+                {
+                    "label": str(dim.label),
+                    "size": int(dim.size),
+                    "stride": int(dim.stride),
+                }
+                for dim in msg.layout.dim
+            ],
+        }
+
+    @staticmethod
+    def _multiarray_shape(
+        msg: Float32MultiArray,
+    ) -> list[int]:
+        """Return the declared shape, such as [30, 13]."""
+        return [int(dim.size) for dim in msg.layout.dim]
+
+    def model_input_window_cb(self, msg: Float32MultiArray) -> None:
+        """Copy the exact recurrent-model input window and enqueue it.
+
+        ``values`` is flattened in the same row-major order supplied by
+        PredictionNode:
+
+            values[0:13]   -> oldest timestep
+            values[-13:]   -> newest timestep
+
+        The corresponding tensor passed to the model is conceptually:
+        ``[batch=1, time=sequence_length, feature=13]``.  The ROS message
+        carries the [time, feature] portion, while the batch dimension is
+        implicit and always one.
+        """
+        self._enqueue(
+            self.model_input_window_topic,
+            {
+                "layout": self._multiarray_layout_dict(msg),
+                "shape": self._multiarray_shape(msg),
+                "feature_order": [
+                    "latitude",
+                    "longitude",
+                    "altitude",
+                    "qx",
+                    "qy",
+                    "qz",
+                    "qw",
+                    "gx",
+                    "gy",
+                    "gz",
+                    "ax",
+                    "ay",
+                    "az",
+                ],
                 "values": [
                     self._finite_float_or_none(value)
                     for value in msg.data
